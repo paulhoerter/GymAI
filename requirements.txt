@@ -3,3 +3,4 @@ numpy
 ultralytics
 matplotlib
 streamlit
+opencv-python-headless
