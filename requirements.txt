@@ -4,3 +4,5 @@ ultralytics
 matplotlib
 streamlit
 opencv-python-headless
+streamlit-webrtc
+av

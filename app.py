@@ -7,6 +7,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import tempfile
+from streamlit_webrtc import webrtc_streamer, RTCConfiguration
+import av
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -184,20 +186,6 @@ def draw_overlay(frame, kp_2d, angle, counter, stage):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
-def update_counter_state(angle):
-    if angle is None:
-        return
-    if angle < 90 and st.session_state.stage == "UP":
-        st.session_state.stage = "DOWN"
-        st.session_state.min_angle = angle
-    if st.session_state.stage == "DOWN":
-        st.session_state.min_angle = min(st.session_state.min_angle, angle)
-    if st.session_state.stage == "DOWN" and angle > 120 and st.session_state.min_angle < 70:
-        st.session_state.stage = "UP"
-        st.session_state.counter += 1
-        st.session_state.min_angle = 180
-
-
 def update_counter_local(angle, counter, stage, min_angle):
     """Version sans session_state pour le traitement video offline."""
     if angle is None:
@@ -215,10 +203,10 @@ def update_counter_local(angle, counter, stage, min_angle):
 
 
 def reset_state():
-    st.session_state.counter   = 0
-    st.session_state.stage     = "UP"
-    st.session_state.min_angle = 180
-    st.session_state.ref_bones = None
+    if "wcam" in st.session_state:
+        st.session_state.wcam.update({
+            "counter": 0, "stage": "UP", "min_angle": 180, "ref_bones": None,
+        })
 
 
 def open_video_writer(path, fourcc_str, fps, size):
@@ -231,58 +219,56 @@ def open_video_writer(path, fourcc_str, fps, size):
     return None, False
 
 # ---------------------------------------------------------------------------
-# Mode Webcam  -- une seule image composite par frame, zero widget reconstruit
+# Mode Webcam  -- WebRTC pour compatibilite navigateur (telephone + PC)
 # ---------------------------------------------------------------------------
 
+RTC_CONF = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+
 def run_webcam(model):
-    run = st.toggle("Activer la webcam")
-    frame_ph = st.empty()
+    # Etat partage entre le callback WebRTC et le thread principal
+    # (dict mutable capture par closure, GIL protege les ops atomiques)
+    if "wcam" not in st.session_state:
+        st.session_state.wcam = {
+            "ref_bones": None, "counter": 0,
+            "stage": "UP", "min_angle": 180,
+        }
+    s = st.session_state.wcam
 
-    if not run:
-        frame_ph.info("Activez la webcam pour commencer")
-        return
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.error("Impossible d'ouvrir la webcam")
-        return
-
-    fig = plt.figure(figsize=(4, 4))
-    ax  = fig.add_subplot(111, projection='3d')
-
-    # Image 3D persistante (mise a jour toutes les N frames)
-    canvas_3d = np.ones((T_HEIGHT, T_WIDTH, 3), dtype=np.uint8) * 255
-    n = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_s = cv2.resize(frame, (T_WIDTH, T_HEIGHT))
+    def video_callback(frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        frame_s = cv2.resize(img, (T_WIDTH, T_HEIGHT))
         frame_s = cv2.flip(frame_s, 1)
 
-        kp_2d, kp_3d, _, angle, st.session_state.ref_bones = infer_frame(
-            frame_s, model, st.session_state.ref_bones)
-        update_counter_state(angle)
+        kp_2d, _, _, angle, s["ref_bones"] = infer_frame(
+            frame_s, model, s["ref_bones"])
 
-        # Overlay 2D
-        canvas_2d = frame_s.copy()
-        draw_overlay(canvas_2d, kp_2d, angle,
-                     st.session_state.counter, st.session_state.stage)
+        # Counter logic
+        if angle is not None:
+            if angle < 90 and s["stage"] == "UP":
+                s["stage"] = "DOWN"
+                s["min_angle"] = angle
+            if s["stage"] == "DOWN":
+                s["min_angle"] = min(s["min_angle"], angle)
+            if s["stage"] == "DOWN" and angle > 120 and s["min_angle"] < 70:
+                s["stage"] = "UP"
+                s["counter"] += 1
+                s["min_angle"] = 180
 
-        # Rendu 3D toutes les 10 frames seulement
-        if kp_3d is not None and n % 10 == 0:
-            canvas_3d = render_3d_to_bgr(ax, fig, kp_3d, (T_WIDTH, T_HEIGHT))
+        draw_overlay(frame_s, kp_2d, angle, s["counter"], s["stage"])
 
-        # Une seule image envoyee a Streamlit
-        combined = np.hstack([canvas_2d, canvas_3d])
-        frame_ph.image(cv2.cvtColor(combined, cv2.COLOR_BGR2RGB),
-                       use_container_width=True)
-        n += 1
+        return av.VideoFrame.from_ndarray(
+            cv2.cvtColor(frame_s, cv2.COLOR_BGR2RGB), format="rgb24")
 
-    cap.release()
-    plt.close(fig)
+    webrtc_streamer(
+        key="squat-webcam",
+        video_frame_callback=video_callback,
+        rtc_configuration=RTC_CONF,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
 # ---------------------------------------------------------------------------
 # Mode Video  -- traitement offline puis lecture fluide avec st.video()
@@ -390,10 +376,6 @@ def run_video(model):
 def main():
     st.set_page_config(page_title="Squat Counter AI", layout="wide")
     st.title("Squat Counter AI")
-
-    for k, v in {"counter": 0, "stage": "UP", "min_angle": 180, "ref_bones": None}.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
 
     mode = st.radio("Source", ["Webcam", "Video"], horizontal=True)
 
